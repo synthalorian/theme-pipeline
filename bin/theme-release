@@ -74,8 +74,10 @@ py() { timeout 600 nice -n 10 python3 -I "$@"; }
 # is complete, then rename into place, so a failed copy never leaves a partial file.
 install_artifact() {
   local tmp
-  tmp="$(dirname -- "$2")/.$(basename -- "$2").tmp.$$"
-  if cp -fT -- "$1" "$tmp" && cmp -s -- "$1" "$tmp" && mv -fT -- "$tmp" "$2"; then return 0; fi
+  # mktemp creates the temp file exclusively (O_EXCL), so a planted symlink is never followed.
+  if [[ -L $2 || ( -e $2 && ! -f $2 ) ]]; then echo "  refusing to replace $2: symlink or not a regular file" >&2; return 1; fi
+  tmp=$(mktemp -- "$(dirname -- "$2")/.$(basename -- "$2").tmp.XXXXXX") || { echo "  cannot write $2" >&2; return 1; }
+  if cat -- "$1" >"$tmp" && chmod 644 -- "$tmp" && cmp -s -- "$1" "$tmp" && mv -fT -- "$tmp" "$2"; then return 0; fi
   rm -f -- "$tmp"
   echo "  cannot write $2" >&2
   return 1

@@ -189,6 +189,9 @@ expect "rendered SVG is well-formed XML" 0 python3 -I -c "import xml.etree.Eleme
 dir=$(copy testforge fake-preview); head -c 24 "$dir/preview.png" >"$dir/p" && mv "$dir/p" "$dir/preview.png"
 expect "24-byte fake preview.png fails the preview step" 1 python3 -I "$LIB/render_preview.py" "$dir" "$T/prev3" testforge 1.2.0
 has "fake preview.png reported" 'FAIL.*preview.png is not a valid PNG'
+# artifact install never follows a planted temp-name symlink or a symlinked destination
+expect "install_artifact refuses a symlinked destination" 1 bash -c 'source <(sed -n "/^install_artifact() {/,/^}/p" "$1"); echo v >"$2/victim2"; echo new >"$2/src"; ln -sf "$2/victim2" "$2/dst"; install_artifact "$2/src" "$2/dst"; rc=$?; [[ $(cat "$2/victim2") == v ]] || exit 9; exit $rc' _ "$ROOT/bin/theme-release" "$T"
+expect "install_artifact ignores a planted predictable temp symlink" 0 bash -c 'source <(sed -n "/^install_artifact() {/,/^}/p" "$1"); echo v >"$2/victim3"; echo new >"$2/src"; ln -sf "$2/victim3" "$2/.dst3.tmp.$$"; install_artifact "$2/src" "$2/dst3" && [[ $(cat "$2/victim3") == v && $(cat "$2/dst3") == new ]]' _ "$ROOT/bin/theme-release" "$T"
 # preview writes never follow a symlink at the destination
 mkdir -p "$T/prev5"; echo victim >"$T/victim.txt"; ln -s "$T/victim.txt" "$T/prev5/testforge-1.2.0-preview.svg"
 expect "preview refuses a symlinked destination" 1 python3 -I "$LIB/render_preview.py" "$FIX/testforge" "$T/prev5" testforge 1.2.0
