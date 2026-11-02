@@ -148,7 +148,7 @@ def check_assets(c: Checks, theme: Path):
     for name in ("install.sh", "uninstall.sh"):
         p = theme / name
         if not p.is_file():
-            c.warn(f"{name} missing (Glyphsmith releases ship install.sh/uninstall.sh)")
+            c.warn(f"{name} missing (themes that ship install.sh/uninstall.sh usually include both)")
         elif not os.access(p, os.X_OK):
             c.warn(f"{name} is not executable (it will ship as 0644)")
     for p in [theme / "preview.png"] + sorted((theme / "screenshots").glob("*.png")):

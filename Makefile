@@ -1,4 +1,4 @@
-# Glyphsmith theme release pipeline.
+# Omarchy 4 theme release pipeline.
 #   make release THEME=<theme-dir> [OUT=<dir>] [NAME=<name>]
 #   make test
 SHELL := /bin/bash

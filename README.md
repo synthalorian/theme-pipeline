@@ -2,7 +2,7 @@
 
 One command that takes an Omarchy 4 theme folder from "looks done" to "ready for sign-off":
 it validates the files, checks WCAG contrast, renders a preview, builds a reproducible
-release archive exactly like the Glyphsmith Steel & Ember release, and runs the
+release archive (the same format as the Steel & Ember theme releases, its first user), and runs the
 pre-publish gate and gitleaks on what actually ships. It ends with a PASS/FAIL summary.
 
 It only reads the theme folder. It never pushes, publishes or touches the network.
@@ -17,7 +17,7 @@ make test
 
 - bash, GNU tar, gzip, coreutils, git
 - Python 3.11+ (stdlib only: `tomllib`, `zlib`, `tarfile`)
-- `/workspace/pre-publish-gate/gate.sh` (override with `GATE=`)
+- Optional: a pre-publish gate script, set with `GATE=` (default `/workspace/pre-publish-gate/gate.sh` if it exists). Without one, step 5 is skipped with a clear message
 - Optional: `gitleaks` on PATH; `rsvg-convert` or ImageMagick to also rasterize the SVG preview with real glyphs
 
 ## What `make release` does
@@ -25,10 +25,10 @@ make test
 | Step | Checks | Fails when |
 |---|---|---|
 | 1. validate files | `colors.toml` parses with `tomllib`, `mode` is `dark`/`light`, all 25 Omarchy 4 palette keys are present (26 with `mode`, the same list as Glazier's `validate-theme.sh`), values are valid colors. `VERSION` is strict SemVer 2.0.0 (no leading zeros in numeric identifiers, prerelease ones included, so `1.2.3-01` fails). CHANGELOG has a non-empty heading for that version. README and LICENSE are present and non-empty, and README local links/images point to files that ship. `backgrounds/` has an image. `preview.png` and `screenshots/*.png` are fully checked PNGs (see step 3). No junk (`.DS_Store`, `*~`, `*.bak`/`.orig`/`.swp`, `.#*`, nested `.git`, archives, caches, `.gitleaks.toml`), no symlinks or special files, no unreplaced `{{VERSION}}`-style placeholders. Warns about a missing or non-executable `install.sh`/`uninstall.sh`, hidden files, files Omarchy 4 ignores for git installs (`*.lua`, `kitty.conf`, …), `colorN` that differ from their semantic key, and uncommitted changes in a git checkout | any check fails |
-| 2. WCAG contrast | foreground/background, selection text on selection background, color1–color7 on background: **4.5:1**. Cursor and accent on background: **3:1** (non-text). Bright colors, `dark/light/bright_foreground` and `muted` are advisory. color0 (and color7 when within 1.5:1 of the background) is a background-shade slot and is listed but not judged. The math mirrors `/workspace/qa/tools/contrast-check.py` | an enforced pair is below its minimum |
+| 2. WCAG contrast | foreground/background, selection text on selection background, color1–color7 on background: **4.5:1**. Cursor and accent on background: **3:1** (non-text). Bright colors, `dark/light/bright_foreground` and `muted` are advisory. color0 (and color7 when within 1.5:1 of the background) is a background-shade slot and is listed but not judged. The math is the WCAG 2.x definition, built in (`lib/common.py`) | an enforced pair is below its minimum |
 | 3. preview | Renders `OUT/previews/<name>-<ver>-preview.svg` (real monospace text) and `.png` (a pure-stdlib PNG encoder: palette, terminal mock, 16 ANSI swatches; text is drawn as word bars). Also checks the theme's own `preview.png` is a valid PNG and lists `screenshots/`. The PNG check is structural, not just the signature: every chunk length and CRC, IHDR first with valid fields, PLTE for palette images, consecutive IDATs, IEND last with nothing after it, and the image data must decompress to exactly the expected scanlines with valid filter bytes | colors.toml is unusable or `preview.png` is corrupt (missing `preview.png` is a warning) |
-| 4. package | Stages the shipping files (the top-level `.git`, `.github`, `.gitignore`, `.gitattributes`, `tests` and `releases` are left out), then builds `<name>-<ver>.tar.gz` with the `tools/pack/repro-tar.sh` / `templates/build-release.sh` settings: one top-level folder named after the theme, `--sort=name`, GNU format, every mtime = `SOURCE_DATE_EPOCH`, owner 0/0 numeric, modes 0644/0755, `gzip -n --best`, plus a `sha256sum`-format `.sha256`. It builds **twice** from fresh stages and requires byte-identical output, then verifies the archive (paths, owners, mtimes, modes, order, gzip header, content = stage) | the builds differ or the archive shape is wrong |
-| 5. pre-publish gate | Extracts the archive into a temp dir, `git init`s it with one commit by `synthalorian <212206047+synthalorian@users.noreply.github.com>` (no global config or hooks), and runs `gate.sh` on it. `GATE_NAME_PATTERN_FILE` is passed through when set. The pipeline never prints its path or contents, and the gate prints locations only | gate exit ≠ 0, or the gate script is missing |
+| 4. package | Stages the shipping files (the top-level `.git`, `.github`, `.gitignore`, `.gitattributes`, `tests` and `releases` are left out), then builds `<name>-<ver>.tar.gz` with reproducible settings: one top-level folder named after the theme, `--sort=name`, GNU format, every mtime = `SOURCE_DATE_EPOCH`, owner 0/0 numeric, modes 0644/0755, `gzip -n --best`, plus a `sha256sum`-format `.sha256`. It builds **twice** from fresh stages and requires byte-identical output, then verifies the archive (paths, owners, mtimes, modes, order, gzip header, content = stage) | the builds differ or the archive shape is wrong |
+| 5. pre-publish gate | Extracts the archive into a temp dir, `git init`s it with one commit by `$RELEASE_GIT_NAME <$RELEASE_GIT_EMAIL>` (default `synthalorian <212206047+synthalorian@users.noreply.github.com>`; no global config or hooks), and runs `gate.sh` on it. `GATE_NAME_PATTERN_FILE` is passed through when set. The pipeline never prints its path or contents, and the gate prints locations only | gate exit ≠ 0, or `GATE` is set but missing (skipped when `GATE` is unset and the default gate is not there) |
 | 6. gitleaks | `gitleaks dir` on the extracted archive, with the built-in rules pinned (`[extend] useDefault = true`, an empty ignore dir, `GITLEAKS_CONFIG*` unset) and `--redact=100` | any finding (skipped if gitleaks isn't installed) |
 
 Packaging and the gate are skipped once validation fails. The archive and `.sha256` are
@@ -42,8 +42,7 @@ name. It is lowercased, spaces become `-`, and a leading `omarchy-` and trailing
 `omarchy-theme-install` does. The name must match `^[a-z0-9_][a-z0-9._+-]*$`. It is checked before anything
 is written (not even `OUT` is created), so a name like `../../x` is a usage error (exit 2) and can't escape `OUT`.
 
-**mtime:** `SOURCE_DATE_EPOCH` if set, else the last git commit touching the theme folder, else 0 (the
-same rule as `repro-tar.sh` and `build-release.sh`). The published Glyphsmith archives were built with
+**mtime:** `SOURCE_DATE_EPOCH` if set, else the last git commit touching the theme folder, else 0 . The published Steel & Ember archives were built with
 mtime 0, so set `SOURCE_DATE_EPOCH=0` to reproduce them byte for byte (see below).
 
 ### Environment
@@ -51,7 +50,8 @@ mtime 0, so set `SOURCE_DATE_EPOCH=0` to reproduce them byte for byte (see below
 | Variable | Meaning |
 |---|---|
 | `SOURCE_DATE_EPOCH` | archive mtime (integer, 0 to 4102444800) |
-| `GATE` | gate script (default `/workspace/pre-publish-gate/gate.sh`) |
+| `GATE` | gate script. Unset: `/workspace/pre-publish-gate/gate.sh` if present, else step 5 is skipped. Set but missing: FAIL |
+| `RELEASE_GIT_NAME`, `RELEASE_GIT_EMAIL` | identity of the temp commit the gate checks (default synthalorian noreply) |
 | `GATE_NAME_PATTERN_FILE` | passed to the gate for its name-leak check; never printed |
 | `GITLEAKS` | gitleaks binary; `none` skips the step |
 
@@ -95,14 +95,14 @@ and redacted, and usage errors. Regression cases cover unsafe names from `--name
 written inside or outside `OUT`), archive, `.sha256` and report copy failures (FAIL, exit 1, no partial files), shell
 metacharacters in `make release` variables (no injected command runs, and quoted paths still work), and the suite
 aborting when it can't create its temp dir. The real gate is run too: plain, with a non-matching pattern file, and with a matching one. Those
-cases assert that the pattern text and path never appear in the output. Current result: **207 passed, 0 failed** (about 11 s).
+cases assert that the pattern text and path never appear in the output. Tests that need the real gate (`REAL_GATE`, default `/workspace/pre-publish-gate/gate.sh`) skip when it is missing. Current result: **216 passed, 0 failed** (about 11 s).
 
 ## First real run: Steel & Ember 0.1.1
 
-Run on 2026-11-02 against the read-only checkout `/workspace/rel/se` (HEAD `b36e216`, clean working tree):
+Run on 2026-11-02 against a clean, read-only checkout of the theme repo (HEAD `b36e216`):
 
 ```bash
-make release THEME=/workspace/rel/se OUT=out/steel-and-ember
+make release THEME=path/to/omarchy-steel-and-ember-theme OUT=out/steel-and-ember
 ```
 
 **RESULT: PASS** (all six steps).
@@ -116,8 +116,8 @@ make release THEME=/workspace/rel/se OUT=out/steel-and-ember
 | 5. gate | PASS. Checks 1–4 and 6 pass. Check 5 was skipped because `GATE_NAME_PATTERN_FILE` was unset. A second run with it set also passed check 5 (`GATE: PASS (0 skipped)`) |
 | 6. gitleaks | PASS (8.30.1, no leaks) |
 
-**Reproducing the reference archive.** With `SOURCE_DATE_EPOCH=0` (the convention of the published Glyphsmith
-archives), the output is **byte-identical** to `/workspace/glyphsmith/releases/steel-and-ember-0.1.1.tar.gz`
+**Reproducing the reference archive.** With `SOURCE_DATE_EPOCH=0` (the convention of the published
+archives), the output is **byte-identical** to the published `steel-and-ember-0.1.1.tar.gz` release asset
 (sha256 `36c12b38b40fde300a56aa0d940f5356704e87e22d2c5876aa15e2b6902dfdc8`, 4,342,078 bytes). With the
 default git-commit mtime, the extracted files are identical to the reference and only the timestamps differ.
 
@@ -125,8 +125,7 @@ default git-commit mtime, the extracted files are identical to the reference and
 
 - The stdlib PNG preview draws text as colored word bars, not glyphs. The SVG has real text. If `rsvg-convert` or
   ImageMagick is installed, a glyph-accurate `*.svg.png` is written too (neither is on the build box today).
-- Contrast covers `colors.toml` only. Per-app files (`btop.theme`, `shell.toml`, …) are not paired. Use
-  `/workspace/qa/tools/contrast-check.py` for those.
+- Contrast covers `colors.toml` only. Per-app files (`btop.theme`, `shell.toml`, …) are not paired. Check those with a separate contrast tool.
 - Install, uninstall and reinstall in a clean environment (RELEASE-CHECKLIST item 6) are not run here. That remains the
   bubblewrap release test.
 - Nothing is signed. Sign-off and publishing stay manual (RELEASE-CHECKLIST item 8).
