@@ -280,6 +280,18 @@ expect "no gate configured -> PASS with gate SKIP" 0 env GITLEAKS=none DEFAULT_G
   "$T/nope/default-gate.sh" "$REL" "$ROOT/bin/.theme-release-nogate" "$FIX/testforge" "$T/out8b"
 has "summary marks gate SKIP (no gate configured)" 'SKIP \(no gate configured\) +5\. pre-publish gate'
 has "skip message says how to enable the gate" 'set GATE=<path to gate script>'
+# Skipping the gate must not skip secret scanning: gitleaks still scans the extracted archive.
+printf '#!/usr/bin/env bash\nd=${@: -1}\necho "stub scanner on $(basename "$d"): $(find "$d" -type f | wc -l) files"\nexit "${SCAN_RC:-0}"\n' \
+  >"$T/bin/scanner.sh" && chmod +x "$T/bin/scanner.sh"
+expect "no gate configured, scanner finds a leak -> FAIL" 1 env GITLEAKS="$T/bin/scanner.sh" SCAN_RC=1 \
+  "$ROOT/bin/.theme-release-nogate" "$FIX/testforge" --out "$T/out8c"
+has "summary marks gitleaks FAIL without a gate" 'FAIL +6\. gitleaks'
+has "scanner saw the extracted archive" 'stub scanner on testforge: [1-9][0-9]* files'
+[[ ! -e $T/out8c/testforge-1.2.0.tar.gz ]] && ok "no archive when gitleaks fails without a gate" \
+  || bad "no archive when gitleaks fails without a gate"
+expect "no gate configured, clean scan -> PASS" 0 env GITLEAKS="$T/bin/scanner.sh" \
+  "$ROOT/bin/.theme-release-nogate" "$FIX/testforge" --out "$T/out8d"
+has "summary marks gitleaks PASS without a gate" 'PASS +6\. gitleaks'
 rm -f -- "$ROOT/bin/.theme-release-nogate"
 
 if command -v gitleaks >/dev/null; then
