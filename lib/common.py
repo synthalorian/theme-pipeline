@@ -1,6 +1,6 @@
 """Shared helpers for the theme release pipeline (stdlib only).
 
-Color math mirrors /workspace/qa/tools/contrast-check.py (WCAG 2.x relative
+Color math follows the WCAG 2.x definition (WCAG 2.x relative
 luminance and contrast ratio, same color syntax), so ratios printed here match
 the QA tool for the same colors.
 """
@@ -14,7 +14,7 @@ import tomllib
 import zlib
 from pathlib import Path
 
-# The 25 Omarchy 4 palette keys every Glyphsmith theme defines (same list as
+# The 25 Omarchy 4 palette keys a complete theme defines (same list as
 # tests/validators/validate-theme.sh). With `mode` that makes 26 required keys.
 PALETTE_KEYS = (
     "accent background foreground selection muted dark_background darker_background "

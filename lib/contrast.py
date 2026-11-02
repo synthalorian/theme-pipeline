@@ -15,7 +15,7 @@ Advisory (WARN only):
   text 4.5:1  bright ANSI colors, dark/light/bright_foreground on background
   ui   3.0:1  muted (comments, inactive text) on background
 
-The math and the background-shade rule mirror /workspace/qa/tools/contrast-check.py.
+The math and the background-shade rule follow WCAG 2.x (see common.py).
 Exit 0 = no FAIL, 1 = at least one FAIL, 2 = colors.toml missing/unparsable.
 """
 from __future__ import annotations

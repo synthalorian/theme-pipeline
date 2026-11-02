@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Build a byte-reproducible <out>.tar.gz plus <out>.tar.gz.sha256 from a
-# staged folder, with the same tar/gzip settings as Glyphsmith's
-# tools/pack/repro-tar.sh and templates/build-release.sh (the Steel & Ember
-# release): one top-level folder, entries sorted by name, every mtime =
+# staged folder, with the same tar/gzip settings as the published Steel & Ember
+# release archives: one top-level folder, entries sorted by name, every mtime =
 # SOURCE_DATE_EPOCH, owner/group 0/0 numeric, normalized modes, GNU format,
 # gzip -n --best (no name, no timestamp).
 #

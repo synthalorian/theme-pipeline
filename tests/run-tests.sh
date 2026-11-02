@@ -2,16 +2,17 @@
 # Test suite for theme-pipeline. Builds throwaway copies of the fixture themes
 # under a temp dir, mutates them into bad themes, and checks every step.
 # Usage: tests/run-tests.sh   (exit 0 = all assertions passed)
-# Set SKIP_REAL_GATE=1 to skip the tests that call /workspace/pre-publish-gate/gate.sh.
+# Set SKIP_REAL_GATE=1 to skip the tests that call the real gate ($REAL_GATE, default
+# /workspace/pre-publish-gate/gate.sh); they also skip when it is missing.
 set -uo pipefail
 export LC_ALL=C TZ=UTC
-unset SOURCE_DATE_EPOCH GATE_NAME_PATTERN_FILE GATE
+REAL_GATE=${REAL_GATE:-/workspace/pre-publish-gate/gate.sh}
+unset SOURCE_DATE_EPOCH GATE_NAME_PATTERN_FILE GATE RELEASE_GIT_NAME RELEASE_GIT_EMAIL
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 FIX=$ROOT/tests/fixtures
 LIB=$ROOT/lib
 REL=$ROOT/bin/theme-release
-REAL_GATE=/workspace/pre-publish-gate/gate.sh
 # Every fixture copy and stub lives under $T: never continue without it (an empty T
 # would turn "$T/themes" and "$T/bin" into /themes and /bin).
 T=$(mktemp -d "${TMPDIR:-/tmp}/theme-pipeline-test.XXXXXX") && [[ -n $T && -d $T ]] \
@@ -235,6 +236,7 @@ has "stub gate saw noreply identity" 'stub gate on testforge: identity'
 A=$T/out1/testforge-1.2.0.tar.gz
 [[ -f $A && -f $A.sha256 ]] && ok "archive and .sha256 written" || bad "archive and .sha256 written" "$(ls -la "$T/out1")"
 [[ -f $T/out1/testforge-1.2.0.release-report.txt ]] && ok "report written" || bad "report written"
+if grep -rqi glyphsmith -- "$T/out1" || grep -qi glyphsmith <<<"$OUTPUT"; then bad "output is unbranded (no Glyphsmith)"; else ok "output is unbranded (no Glyphsmith)"; fi
 [[ -f $T/out1/previews/testforge-1.2.0-preview.png ]] && ok "preview written to OUT/previews" || bad "preview written"
 expect "sha256 file verifies" 0 bash -c "cd '$T/out1' && sha256sum -c testforge-1.2.0.tar.gz.sha256"
 expect "archive verifier passes" 0 python3 -I "$LIB/verify_archive.py" "$A" testforge 1790000000
@@ -272,6 +274,25 @@ has "summary marks gate FAIL" 'FAIL +5\. pre-publish gate'
 [[ ! -e $T/out7/testforge-1.2.0.tar.gz ]] && ok "no archive when gate fails" || bad "no archive when gate fails"
 expect "missing gate -> FAIL" 1 env GITLEAKS=none GATE="$T/nope/gate.sh" "$REL" "$FIX/testforge" --out "$T/out8"
 has "missing gate reported" 'gate script not found'
+# No GATE and no default gate on this machine: step 5 is skipped, not failed.
+expect "no gate configured -> PASS with gate SKIP" 0 env GITLEAKS=none DEFAULT_GATE_TEST=1 \
+  bash -c 'sed "s#^DEFAULT_GATE=.*#DEFAULT_GATE=$1#" "$2" >"$3" && chmod +x "$3" && "$3" "$4" --out "$5"' _ \
+  "$T/nope/default-gate.sh" "$REL" "$ROOT/bin/.theme-release-nogate" "$FIX/testforge" "$T/out8b"
+has "summary marks gate SKIP (no gate configured)" 'SKIP \(no gate configured\) +5\. pre-publish gate'
+has "skip message says how to enable the gate" 'set GATE=<path to gate script>'
+# Skipping the gate must not skip secret scanning: gitleaks still scans the extracted archive.
+printf '#!/usr/bin/env bash\nd=${@: -1}\necho "stub scanner on $(basename "$d"): $(find "$d" -type f | wc -l) files"\nexit "${SCAN_RC:-0}"\n' \
+  >"$T/bin/scanner.sh" && chmod +x "$T/bin/scanner.sh"
+expect "no gate configured, scanner finds a leak -> FAIL" 1 env GITLEAKS="$T/bin/scanner.sh" SCAN_RC=1 \
+  "$ROOT/bin/.theme-release-nogate" "$FIX/testforge" --out "$T/out8c"
+has "summary marks gitleaks FAIL without a gate" 'FAIL +6\. gitleaks'
+has "scanner saw the extracted archive" 'stub scanner on testforge: [1-9][0-9]* files'
+[[ ! -e $T/out8c/testforge-1.2.0.tar.gz ]] && ok "no archive when gitleaks fails without a gate" \
+  || bad "no archive when gitleaks fails without a gate"
+expect "no gate configured, clean scan -> PASS" 0 env GITLEAKS="$T/bin/scanner.sh" \
+  "$ROOT/bin/.theme-release-nogate" "$FIX/testforge" --out "$T/out8d"
+has "summary marks gitleaks PASS without a gate" 'PASS +6\. gitleaks'
+rm -f -- "$ROOT/bin/.theme-release-nogate"
 
 if command -v gitleaks >/dev/null; then
   dir=$(copy testforge leaky)
