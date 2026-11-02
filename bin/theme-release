@@ -158,7 +158,15 @@ main() {
       else
         echo "  GATE_NAME_PATTERN_FILE: unset (gate check 5 will be skipped)"
       fi
-      timeout 1200 nice -n 10 bash "$GATE" "$repo"
+      # The gate refuses to run while the load average is above 8: wait and retry a few times.
+      local try r
+      for try in 1 2 3 4; do
+        timeout 1200 nice -n 10 bash "$GATE" "$repo" 2>&1 | tee "$WORK/gate.out"
+        r=${PIPESTATUS[0]}
+        ((r == 2)) && grep -q 'refusing to run' "$WORK/gate.out" && ((try < 4)) || return "$r"
+        echo "  gate refused (high load); retry $((try + 1))/4 in 30s"
+        sleep 30
+      done
     }
     step "$title" gate
   fi
