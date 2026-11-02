@@ -97,6 +97,10 @@ def png_info(path) -> tuple[int, int]:
                 raise ValueError("bad IHDR")
             ihdr = struct.unpack(">IIBBBBB", body)
         elif tag == b"PLTE":
+            if plte or seen_idat or length == 0 or length % 3 or length > 768:
+                raise ValueError("bad PLTE chunk (duplicate, after IDAT, or bad length)")
+            if ihdr[3] in (0, 4):
+                raise ValueError("PLTE not allowed for greyscale images")
             plte = True
         elif tag == b"IDAT":
             if idat_done:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import shutil
 import struct
 import subprocess
+import os
 import sys
 import tomllib
 import zlib
@@ -127,6 +128,27 @@ def layout(d: dict, name: str, version: str):
     return rects, texts
 
 
+def safe_write(path: Path, data: bytes) -> None:
+    """Write via a fresh temp file renamed into place; refuse a symlink (or non-file) destination."""
+    path = Path(path)
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise OSError(f"refusing to write through {path}: it is a symlink or not a regular file")
+    if path.parent.is_symlink():
+        raise OSError(f"refusing to write into {path.parent}: it is a symlink")
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def write_svg(path: Path, rects, texts):
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}">']
     for x, y, w, h, rgb in rects:
@@ -135,7 +157,7 @@ def write_svg(path: Path, rects, texts):
         out.append(f'<text x="{x:.0f}" y="{y:.0f}" fill="{hexrgb(rgb)}" font-size="{size}" '
                    f'font-family="JetBrains Mono, DejaVu Sans Mono, monospace" xml:space="preserve">{escape(s)}</text>')
     out.append("</svg>")
-    path.write_text("\n".join(out) + "\n")
+    safe_write(path, ("\n".join(out) + "\n").encode("utf-8"))
 
 
 def write_png(path: Path, rects, texts):
@@ -168,11 +190,13 @@ def write_png(path: Path, rects, texts):
 
     png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)) \
         + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
-    path.write_bytes(png)
+    safe_write(path, png)
 
 
 def rasterize_svg(svg: Path) -> Path | None:
     dst = svg.with_suffix(".svg.png")
+    if dst.is_symlink() or (dst.exists() and not dst.is_file()):
+        return None
     for cmd in (["rsvg-convert", "-o", str(dst), str(svg)], ["magick", str(svg), str(dst)],
                 ["convert", str(svg), str(dst)]):
         if shutil.which(cmd[0]):

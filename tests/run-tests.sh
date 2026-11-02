@@ -189,6 +189,23 @@ expect "rendered SVG is well-formed XML" 0 python3 -I -c "import xml.etree.Eleme
 dir=$(copy testforge fake-preview); head -c 24 "$dir/preview.png" >"$dir/p" && mv "$dir/p" "$dir/preview.png"
 expect "24-byte fake preview.png fails the preview step" 1 python3 -I "$LIB/render_preview.py" "$dir" "$T/prev3" testforge 1.2.0
 has "fake preview.png reported" 'FAIL.*preview.png is not a valid PNG'
+# preview writes never follow a symlink at the destination
+mkdir -p "$T/prev5"; echo victim >"$T/victim.txt"; ln -s "$T/victim.txt" "$T/prev5/testforge-1.2.0-preview.svg"
+expect "preview refuses a symlinked destination" 1 python3 -I "$LIB/render_preview.py" "$FIX/testforge" "$T/prev5" testforge 1.2.0
+[[ $(cat "$T/victim.txt") == victim ]] && ok "symlink target untouched by preview" || bad "symlink target untouched by preview"
+# PLTE structure: empty PLTE after IDAT is rejected
+expect "empty PLTE after IDAT rejected" 0 python3 -I -c "
+import struct, zlib, sys; sys.path.insert(0, '$LIB')
+from common import png_info
+def ch(t, b): return struct.pack('>I', len(b)) + t + b + struct.pack('>I', zlib.crc32(t + b) & 0xFFFFFFFF)
+ihdr = struct.pack('>IIBBBBB', 1, 1, 8, 3, 0, 0, 0)
+def png(*c): open('$T/p.png', 'wb').write(b'\x89PNG\r\n\x1a\n' + b''.join(c))
+idat = ch(b'IDAT', zlib.compress(b'\x00\x00'))
+png(ch(b'IHDR', ihdr), idat, ch(b'PLTE', b''), ch(b'IEND', b''))
+try: png_info('$T/p.png'); sys.exit(1)
+except ValueError: pass
+png(ch(b'IHDR', ihdr), ch(b'PLTE', b'\x00\x00\x00'), idat, ch(b'IEND', b''))
+png_info('$T/p.png')"
 mkdir -p "$T/prev4/sub"
 expect "render_preview refuses a traversing name" 2 python3 -I "$LIB/render_preview.py" "$FIX/testforge" "$T/prev4/sub" ../../escaped 1.2.0
 expect "render_preview refuses a traversing version" 2 python3 -I "$LIB/render_preview.py" "$FIX/testforge" "$T/prev4/sub" testforge ../../x
