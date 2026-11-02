@@ -40,15 +40,6 @@ done
 [[ -n $THEME ]] || usage
 [[ -d $THEME ]] || die "not a directory: $THEME"
 THEME=$(cd -- "$THEME" && pwd -P)
-# Check before creating anything: the theme dir is never written to.
-OUT=$(realpath -m -- "$OUT") || die "bad output dir: $OUT"
-case "$OUT/" in "$THEME"/*) die "output dir must not be inside the theme dir" ;; esac
-mkdir -p -- "$OUT" || die "cannot create output dir: $OUT"
-OUT=$(cd -- "$OUT" && pwd -P)
-case "$OUT/" in "$THEME"/*) die "output dir must not be inside the theme dir" ;; esac
-command -v python3 >/dev/null || die "python3 is required"
-[[ $(tar --version 2>/dev/null) == *'GNU tar'* ]] || die "GNU tar is required"
-
 # Theme name: --name, else the git remote basename (omarchy-<name>-theme), else the folder name.
 name_source="folder name"
 if [[ -n $NAME ]]; then
@@ -61,10 +52,34 @@ else
 fi
 raw=${raw%.git}
 NAME=$(printf '%s' "$raw" | tr '[:upper:] ' '[:lower:]-' | sed -E 's/^omarchy-//; s/-theme$//')
+# The name becomes file names under OUT (previews, archive, report): refuse an unsafe one
+# before anything is written. Same pattern as NAME_RE in lib/common.py.
+[[ $NAME =~ ^[a-z0-9_][a-z0-9._+-]*$ ]] \
+  || die "theme name '$NAME' (from $name_source) does not match ^[a-z0-9_][a-z0-9._+-]*$"
+
+# Check before creating anything: the theme dir is never written to.
+OUT=$(realpath -m -- "$OUT") || die "bad output dir: $OUT"
+case "$OUT/" in "$THEME"/*) die "output dir must not be inside the theme dir" ;; esac
+mkdir -p -- "$OUT" || die "cannot create output dir: $OUT"
+OUT=$(cd -- "$OUT" && pwd -P)
+case "$OUT/" in "$THEME"/*) die "output dir must not be inside the theme dir" ;; esac
+command -v python3 >/dev/null || die "python3 is required"
+[[ $(tar --version 2>/dev/null) == *'GNU tar'* ]] || die "GNU tar is required"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/theme-release.XXXXXX") || die "mktemp failed"
 trap 'rm -rf -- "$WORK"' EXIT
 py() { timeout 600 nice -n 10 python3 -I "$@"; }
+
+# install_artifact <src> <dest>: copy via a temp file in the same dir, check the copy
+# is complete, then rename into place, so a failed copy never leaves a partial file.
+install_artifact() {
+  local tmp
+  tmp="$(dirname -- "$2")/.$(basename -- "$2").tmp.$$"
+  if cp -fT -- "$1" "$tmp" && cmp -s -- "$1" "$tmp" && mv -fT -- "$tmp" "$2"; then return 0; fi
+  rm -f -- "$tmp"
+  echo "  cannot write $2" >&2
+  return 1
+}
 
 main() {
   local -a STEP_NAMES=() STEP_RESULTS=()
@@ -201,11 +216,17 @@ main() {
     [[ ${STEP_RESULTS[i]} == FAIL* ]] && fails=$((fails + 1))
   done
   if ((fails == 0)) && [[ -n $tarball ]]; then
-    cp -f -- "$tarball" "$tarball.sha256" "$OUT/"
-    echo "  artifact: $OUT/$NAME-$version.tar.gz"
-    echo "  sha256  : $(cut -d' ' -f1 "$OUT/$NAME-$version.tar.gz.sha256")"
-    echo "RESULT: PASS"
-    return 0
+    if install_artifact "$tarball" "$OUT/$NAME-$version.tar.gz" \
+        && install_artifact "$tarball.sha256" "$OUT/$NAME-$version.tar.gz.sha256"; then
+      echo "  artifact: $OUT/$NAME-$version.tar.gz"
+      echo "  sha256  : $(cut -d' ' -f1 "$OUT/$NAME-$version.tar.gz.sha256")"
+      echo "RESULT: PASS"
+      return 0
+    fi
+    rm -f -- "$OUT/$NAME-$version.tar.gz" "$OUT/$NAME-$version.tar.gz.sha256"
+    echo "  [FAIL] could not write the archive to $OUT (disk full or permissions?)"
+    echo "RESULT: FAIL"
+    return 1
   fi
   echo "  no archive written to $OUT ($fails failing step(s))"
   [[ -e $OUT/$NAME-$version.tar.gz ]] && echo "  note: $OUT/$NAME-$version.tar.gz is from an earlier run"
@@ -216,6 +237,11 @@ main() {
 main 2>&1 | tee "$WORK/report.txt"
 rc=${PIPESTATUS[0]}
 read -r id_name id_version <"$WORK/id" 2>/dev/null || { id_name=$NAME id_version=unknown; }
-cp -f -- "$WORK/report.txt" "$OUT/$id_name-$id_version.release-report.txt"
-echo "report: $OUT/$id_name-$id_version.release-report.txt"
+report=$OUT/$id_name-$id_version.release-report.txt
+if install_artifact "$WORK/report.txt" "$report"; then
+  echo "report: $report"
+else
+  echo "RESULT: FAIL (the release report could not be written)"
+  ((rc == 0)) && rc=1
+fi
 exit "$rc"

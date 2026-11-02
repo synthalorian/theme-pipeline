@@ -9,7 +9,9 @@ from __future__ import annotations
 import os
 import re
 import stat
+import struct
 import tomllib
+import zlib
 from pathlib import Path
 
 # The 25 Omarchy 4 palette keys every Glyphsmith theme defines (same list as
@@ -29,11 +31,15 @@ SLOT_KEYS = (
     "bright_yellow bright_blue bright_magenta bright_cyan bright_foreground"
 ).split()
 
+# SemVer 2.0.0: numeric identifiers (including numeric prerelease identifiers)
+# have no leading zeros; build metadata identifiers may.
+_PRE_ID = r"(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
 SEMVER = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
-    r"(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$"
+    rf"(-{_PRE_ID}(\.{_PRE_ID})*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?\Z"
 )
-NAME_RE = re.compile(r"^[a-z0-9_][a-z0-9._+-]*$")
+# Also checked by bin/theme-release before anything is written: no "/", no leading ".".
+NAME_RE = re.compile(r"^[a-z0-9_][a-z0-9._+-]*\Z")
 
 # Top-level entries of a theme checkout that never ship (repo plumbing).
 TOP_EXCLUDES = {".git", ".github", ".gitignore", ".gitattributes", "tests", "releases"}
@@ -52,6 +58,90 @@ GIT_DROPPED = re.compile(r"^(.*\.lua|alacritty\.toml|kitty\.conf|ghostty\.conf|f
 def is_junk(base: str) -> bool:
     """True for names that must never ship (also skipped when staging)."""
     return base == ".git" or base in JUNK_NAMES or any(r.match(base) for r in JUNK_PATTERNS)
+
+
+# ---------------------------------------------------------------- PNG
+PNG_SIG = b"\x89PNG\r\n\x1a\n"
+# color type -> (allowed bit depths, channels)
+_PNG_TYPES = {0: ((1, 2, 4, 8, 16), 1), 2: ((8, 16), 3), 3: ((1, 2, 4, 8), 1), 4: ((8, 16), 2), 6: ((8, 16), 4)}
+_ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+
+
+def png_info(path) -> tuple[int, int]:
+    """Fully check a PNG file and return (width, height); raise ValueError if it is corrupt.
+
+    Checks the signature, the chunk structure (lengths, every CRC, IHDR first,
+    PLTE before IDAT when required, consecutive IDATs, IEND last with nothing
+    after it), the IHDR fields, and that the zlib image data decompresses to
+    exactly the expected scanlines with valid filter bytes."""
+    data = Path(path).read_bytes()
+    if data[:8] != PNG_SIG:
+        raise ValueError("bad PNG signature")
+    i, n, ihdr, idat, plte, seen_idat, idat_done, ended = 8, len(data), None, [], False, False, False, False
+    while i < n:
+        if ended:
+            raise ValueError("data after IEND")
+        if i + 12 > n:
+            raise ValueError("truncated chunk header")
+        length, tag = struct.unpack(">I4s", data[i:i + 8])
+        if length > 0x7FFFFFFF or i + 12 + length > n:
+            raise ValueError(f"truncated {tag!r} chunk")
+        body = data[i + 8:i + 8 + length]
+        (crc,) = struct.unpack(">I", data[i + 8 + length:i + 12 + length])
+        if zlib.crc32(tag + body) & 0xFFFFFFFF != crc:
+            raise ValueError(f"CRC mismatch in {tag.decode('latin-1')!r} chunk")
+        if ihdr is None and tag != b"IHDR":
+            raise ValueError("first chunk is not IHDR")
+        if tag == b"IHDR":
+            if ihdr is not None or length != 13:
+                raise ValueError("bad IHDR")
+            ihdr = struct.unpack(">IIBBBBB", body)
+        elif tag == b"PLTE":
+            plte = True
+        elif tag == b"IDAT":
+            if idat_done:
+                raise ValueError("IDAT chunks are not consecutive")
+            seen_idat = True
+            idat.append(body)
+        elif tag == b"IEND":
+            ended = True
+        if seen_idat and tag != b"IDAT":
+            idat_done = True
+        i += 12 + length
+    if not ended:
+        raise ValueError("missing IEND (truncated file)")
+    if not idat:
+        raise ValueError("no IDAT chunk")
+    w, h, depth, ctype, comp, filt, interlace = ihdr
+    if not (0 < w <= 0x7FFFFFFF and 0 < h <= 0x7FFFFFFF):
+        raise ValueError(f"bad dimensions {w}x{h}")
+    if ctype not in _PNG_TYPES or depth not in _PNG_TYPES[ctype][0] or comp or filt or interlace not in (0, 1):
+        raise ValueError("bad IHDR fields")
+    if ctype == 3 and not plte:
+        raise ValueError("palette image without PLTE")
+    bits = depth * _PNG_TYPES[ctype][1]
+    passes = [(w, h)] if interlace == 0 else [
+        ((w - x0 + dx - 1) // dx, (h - y0 + dy - 1) // dy) for x0, y0, dx, dy in _ADAM7]
+    rows = [(1 + (pw * bits + 7) // 8, ph) for pw, ph in passes if pw and ph]
+    # Stream the decompression so a large image (or a zlib bomb) is never held in memory.
+    d, buf, z = zlib.decompressobj(), b"", b"".join(idat)
+    try:
+        for stride, count in rows:
+            for _ in range(count):
+                while len(buf) < stride:
+                    inp, z = d.unconsumed_tail or z, b""
+                    out = b"" if d.eof else d.decompress(inp, stride * 64)
+                    if not out:
+                        raise ValueError("image data is shorter than the image")
+                    buf += out
+                if buf[0] > 4:
+                    raise ValueError(f"bad scanline filter type {buf[0]}")
+                buf = buf[stride:]
+        if buf or d.decompress(d.unconsumed_tail or z, 1) or not d.eof:
+            raise ValueError("image data is longer than the image or the zlib stream is incomplete")
+    except zlib.error as e:
+        raise ValueError(f"image data does not decompress: {e}") from None
+    return w, h
 
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}

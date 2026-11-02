@@ -19,7 +19,7 @@ from urllib.parse import unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (GIT_DROPPED, IMAGE_EXT, NAME_RE, PALETTE_KEYS, SEMVER, SLOT_KEYS, VIDEO_EXT,  # noqa: E402
-                    is_junk, is_symlink_or_special, parse_color, ship_entries)
+                    is_junk, is_symlink_or_special, parse_color, png_info, ship_entries)
 
 PLACEHOLDER = re.compile(r"\{\{\s*(VERSION|THEME_NAME|[A-Z_]+)\s*\}\}")
 BIG = 20 * 1024 * 1024
@@ -153,10 +153,10 @@ def check_assets(c: Checks, theme: Path):
             c.warn(f"{name} is not executable (it will ship as 0644)")
     for p in [theme / "preview.png"] + sorted((theme / "screenshots").glob("*.png")):
         if p.is_file() and not p.is_symlink():
-            with p.open("rb") as fh:
-                sig = fh.read(24)
-            if sig[:8] != b"\x89PNG\r\n\x1a\n":
-                c.fail(f"{p.relative_to(theme)} is not a valid PNG")
+            try:
+                png_info(p)
+            except (OSError, ValueError) as e:
+                c.fail(f"{p.relative_to(theme)} is not a valid PNG: {e}")
 
 
 def check_tree(c: Checks, theme: Path, name: str):

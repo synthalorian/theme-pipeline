@@ -12,7 +12,10 @@ FIX=$ROOT/tests/fixtures
 LIB=$ROOT/lib
 REL=$ROOT/bin/theme-release
 REAL_GATE=/workspace/pre-publish-gate/gate.sh
-T=$(mktemp -d "${TMPDIR:-/tmp}/theme-pipeline-test.XXXXXX")
+# Every fixture copy and stub lives under $T: never continue without it (an empty T
+# would turn "$T/themes" and "$T/bin" into /themes and /bin).
+T=$(mktemp -d "${TMPDIR:-/tmp}/theme-pipeline-test.XXXXXX") && [[ -n $T && -d $T ]] \
+  || { echo "run-tests.sh: cannot create a temp dir under ${TMPDIR:-/tmp}; aborting" >&2; exit 2; }
 trap 'rm -rf -- "$T"' EXIT
 
 pass=0 fail=0
@@ -50,6 +53,52 @@ assert parse_color('#abc')[0] == (170,187,204)
 assert parse_color('rgba(f28c38ee)')[1] == 0xee/255
 assert rgb_of('#ffffff80', over=(0,0,0)) == (128,128,128)
 assert parse_color('nope') is None"
+
+echo "== unit: strict semver"
+expect "semver accepts valid and rejects leading-zero prerelease ids" 0 python3 -I -c "
+import sys; sys.path.insert(0, '$LIB')
+from common import SEMVER
+for v in ('1.2.3', '0.1.1', '1.2.3-0', '1.2.3-0a', '1.2.3-01a', '2.0.0-rc.1', '1.0.0-alpha.0.x+001', '1.2.3+0001'):
+    assert SEMVER.match(v), v
+for v in ('1.2.3-01', '1.2.3-rc.01', '1.2.3-00', '01.2.3', '1.2', 'v1.2.3', '1.2.3-', '1.2.3-a..b', '1.2.3\\n'):
+    assert not SEMVER.match(v), v"
+
+echo "== unit: PNG structure checks"
+# pngcase <desc> <python expr producing the bytes, using good/chunk/sig> <expected error regex>
+PNGLIB="import sys, struct, zlib; sys.path.insert(0, '$LIB')
+from common import png_info
+def chunk(t, d): return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+sig = bytes.fromhex('89504e470d0a1a0a')
+ihdr = chunk(b'IHDR', struct.pack('>IIBBBBB', 4, 2, 8, 2, 0, 0, 0))
+good = sig + ihdr + chunk(b'IDAT', zlib.compress(b''.join(b'\\x00' + bytes(12) for _ in range(2)))) + chunk(b'IEND', b'')"
+expect "a well-formed 4x2 PNG is accepted" 0 python3 -I -c "$PNGLIB
+open('$T/ok.png', 'wb').write(good); assert png_info('$T/ok.png') == (4, 2)"
+pngcase() {
+  expect "rejects $1" 0 python3 -I -c "$PNGLIB
+open('$T/bad.png', 'wb').write($2)
+try: png_info('$T/bad.png')
+except ValueError as e: print(e)
+else: raise SystemExit('accepted')"
+  has "$1: reason given" "$3"
+}
+pngcase "24-byte signature+IHDR stub" "sig + ihdr[:16]" 'truncated'
+pngcase "IHDR without IDAT/IEND" "sig + ihdr" 'missing IEND'
+pngcase "bad chunk CRC" "good[:-20] + bytes([good[-20] ^ 1]) + good[-19:]" 'CRC mismatch'
+pngcase "missing IEND" "good[:-12]" 'missing IEND'
+pngcase "data after IEND" "good + b'junk'" 'after IEND'
+pngcase "no IDAT" "sig + ihdr + chunk(b'IEND', b'')" 'no IDAT'
+pngcase "short image data" "sig + ihdr + chunk(b'IDAT', zlib.compress(b'\\x00' + bytes(12))) + chunk(b'IEND', b'')" 'shorter'
+pngcase "long image data" "sig + ihdr + chunk(b'IDAT', zlib.compress(bytes(13 * 3))) + chunk(b'IEND', b'')" 'longer'
+pngcase "non-zlib image data" "sig + ihdr + chunk(b'IDAT', b'not zlib at all') + chunk(b'IEND', b'')" 'does not decompress'
+pngcase "bad filter byte" "sig + ihdr + chunk(b'IDAT', zlib.compress(b'\\x07' + bytes(12) + b'\\x00' + bytes(12))) + chunk(b'IEND', b'')" 'filter type'
+pngcase "zero width" "sig + chunk(b'IHDR', struct.pack('>IIBBBBB', 0, 2, 8, 2, 0, 0, 0)) + good[33:]" 'bad dimensions'
+pngcase "bad bit depth" "sig + chunk(b'IHDR', struct.pack('>IIBBBBB', 4, 2, 3, 2, 0, 0, 0)) + good[33:]" 'bad IHDR fields'
+pngcase "palette image without PLTE" "sig + chunk(b'IHDR', struct.pack('>IIBBBBB', 4, 2, 8, 3, 0, 0, 0)) + good[33:]" 'without PLTE'
+expect "real fixture PNGs are accepted" 0 python3 -I -c "
+import sys, glob; sys.path.insert(0, '$LIB')
+from common import png_info
+fs = glob.glob('$FIX/*/preview.png') + glob.glob('$FIX/*/backgrounds/*.png')
+assert fs and all(png_info(f) for f in fs)"
 
 echo "== good fixtures: validate + contrast"
 for t in testforge daylight; do
@@ -103,6 +152,11 @@ mutate broken-link 'README links to files that do not ship: screenshots/missing.
 mutate escaping-link 'do not ship: ../outside.png' "echo '![x](../outside.png)' >> README.md"
 mutate no-backgrounds 'backgrounds/ missing' "rm -r backgrounds"
 mutate bad-png 'preview.png is not a valid PNG' "echo notpng > preview.png"
+mutate fake-png 'preview.png is not a valid PNG: truncated' "head -c 24 preview.png > p && mv p preview.png"
+mutate bad-crc-png 'preview.png is not a valid PNG: CRC mismatch' \
+  "python3 -c \"b=bytearray(open('preview.png','rb').read());b[30]^=1;open('preview.png','wb').write(b)\""
+mutate bad-screenshot 'screenshots/shot.png is not a valid PNG' "mkdir -p screenshots && head -c 24 preview.png > screenshots/shot.png"
+mutate bad-prerelease 'not semver' "echo 1.2.3-01 > VERSION"
 
 dir=$(copy testforge "Bad Name")
 expect "invalid theme name fails" 1 python3 -I "$LIB/validate.py" "$dir" "Bad Name"
@@ -132,6 +186,14 @@ while i < len(b):
     i += 12 + n
 assert (w, h) == (1200, 720) and len(zlib.decompress(idat)) == h * (1 + 3 * w)"
 expect "rendered SVG is well-formed XML" 0 python3 -I -c "import xml.etree.ElementTree as E; E.parse('$T/prev/testforge-1.2.0-preview.svg')"
+dir=$(copy testforge fake-preview); head -c 24 "$dir/preview.png" >"$dir/p" && mv "$dir/p" "$dir/preview.png"
+expect "24-byte fake preview.png fails the preview step" 1 python3 -I "$LIB/render_preview.py" "$dir" "$T/prev3" testforge 1.2.0
+has "fake preview.png reported" 'FAIL.*preview.png is not a valid PNG'
+mkdir -p "$T/prev4/sub"
+expect "render_preview refuses a traversing name" 2 python3 -I "$LIB/render_preview.py" "$FIX/testforge" "$T/prev4/sub" ../../escaped 1.2.0
+expect "render_preview refuses a traversing version" 2 python3 -I "$LIB/render_preview.py" "$FIX/testforge" "$T/prev4/sub" testforge ../../x
+OUTPUT=$(ls -A "$T/prev4/sub"; ls -d "$T"/*escaped* 2>/dev/null)
+[[ -z $OUTPUT ]] && ok "nothing written for unsafe preview names" || bad "nothing written for unsafe preview names" "$OUTPUT"
 dir=$(copy testforge no-preview); rm "$dir/preview.png"
 expect "missing preview.png is a warning" 0 python3 -I "$LIB/render_preview.py" "$dir" "$T/prev2" testforge 1.2.0
 has "missing preview.png warned" 'WARN.*no preview.png'
@@ -202,6 +264,58 @@ if command -v gitleaks >/dev/null; then
 else
   echo "  skip  gitleaks not on PATH"
 fi
+
+echo "== pipeline: unsafe names are refused before any output"
+mkdir -p "$T/esc/a/b"
+expect "--name ../../escaped -> usage error" 2 env GITLEAKS=none GATE="$T/bin/gate-pass.sh" \
+  "$REL" "$FIX/testforge" --out "$T/esc/a/b/out" --name ../../escaped
+has "unsafe name reported" "theme name '../../escaped' \\(from --name\\) does not match"
+OUTPUT=$(find "$T/esc" -mindepth 1 ! -path "$T/esc/a" ! -path "$T/esc/a/b")
+[[ -z $OUTPUT ]] && ok "nothing written inside or outside OUT for an unsafe name" \
+  || bad "nothing written inside or outside OUT for an unsafe name" "$OUTPUT"
+dir=$(copy testforge remote-escape)
+git -C "$dir" init -q && git -C "$dir" remote add origin 'https://example.invalid/x/..'
+expect "unsafe name from the git remote -> usage error" 2 env GITLEAKS=none GATE="$T/bin/gate-pass.sh" \
+  "$REL" "$dir" --out "$T/esc/a/b/out2"
+has "remote-derived name refused" 'from git remote origin\) does not match'
+[[ ! -e $T/esc/a/b/out2 ]] && ok "OUT not even created for an unsafe name" || bad "OUT not even created for an unsafe name"
+
+echo "== pipeline: failed artifact/report writes are a FAIL"
+mkdir -p "$T/wr1/testforge-1.2.0.tar.gz/blocker"
+expect "archive copy failure -> FAIL" 1 env GITLEAKS=none GATE="$T/bin/gate-pass.sh" "$REL" "$FIX/testforge" --out "$T/wr1"
+has "archive write failure reported" 'could not write the archive'
+hasnt "no PASS when the archive cannot be written" '^RESULT: PASS'
+[[ ! -e $T/wr1/testforge-1.2.0.tar.gz.sha256 ]] && ok "no orphan .sha256 left behind" || bad "no orphan .sha256 left behind"
+OUTPUT=$(ls -A "$T/wr1" | grep '\.tmp\.' || true)
+[[ -z $OUTPUT ]] && ok "no temp files left in OUT" || bad "no temp files left in OUT" "$OUTPUT"
+mkdir -p "$T/wr2/testforge-1.2.0.tar.gz.sha256/blocker"
+expect "checksum copy failure -> FAIL" 1 env GITLEAKS=none GATE="$T/bin/gate-pass.sh" "$REL" "$FIX/testforge" --out "$T/wr2"
+[[ ! -e $T/wr2/testforge-1.2.0.tar.gz ]] && ok "archive removed when its .sha256 cannot be written" \
+  || bad "archive removed when its .sha256 cannot be written"
+mkdir -p "$T/wr3/testforge-1.2.0.release-report.txt/blocker"
+expect "report copy failure -> FAIL" 1 env GITLEAKS=none GATE="$T/bin/gate-pass.sh" "$REL" "$FIX/testforge" --out "$T/wr3"
+has "report write failure reported" '^RESULT: FAIL \(the release report could not be written\)'
+
+echo "== make: values are passed as data, not shell source"
+q1="x\"; touch $T/pwned1; echo \""
+q2="x\$(touch $T/pwned2)\`touch $T/pwned3\`"
+expect "make release with quotes in THEME -> not a directory" 2 make -s -C "$ROOT" release "THEME=$q1"
+expect "make release with backticks/\$() in THEME -> not a directory" 2 make -s -C "$ROOT" release "THEME=$q2"
+expect "make release with backticks in NAME -> unsafe name, nothing run" 2 make -s -C "$ROOT" release \
+  "THEME=$FIX/testforge" "OUT=$T/mk-name" "NAME=a\`touch $T/pwned4\`"
+expect "make release with quotes in OUT -> PASS, nothing run" 0 env GITLEAKS=none GATE="$T/bin/gate-pass.sh" \
+  make -s -C "$ROOT" release "THEME=$FIX/testforge" "OUT=$T/mk-out\"; touch $T/pwned5; \""
+OUTPUT=$(find "$T" -maxdepth 1 -name 'pwned*')
+[[ -z $OUTPUT ]] && ok "no injected command ran" || bad "no injected command ran" "$OUTPUT"
+mk_out="$T/mk out 'q' \"dq\""
+expect "make release with spaces/quotes in OUT and NAME -> PASS" 0 env GITLEAKS=none GATE="$T/bin/gate-pass.sh" \
+  make -s -C "$ROOT" release "THEME=$FIX/testforge" "OUT=$mk_out" "NAME=Forge Y"
+[[ -f "$mk_out/forge-y-1.2.0.tar.gz" ]] && ok "archive written to the quoted OUT" || bad "archive written to the quoted OUT" "$(ls -la "$T")"
+
+echo "== test harness"
+expect "suite aborts when the temp dir cannot be created" 2 env TMPDIR="$T/no/such/dir" bash "$ROOT/tests/run-tests.sh"
+has "abort reason printed" 'cannot create a temp dir'
+hasnt "no test ran without a temp dir" '^  (ok|FAIL) '
 
 echo "== usage errors"
 expect "missing theme dir -> 2" 2 "$REL" "$T/does-not-exist"

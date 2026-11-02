@@ -12,7 +12,8 @@ ImageMagick is on PATH, the SVG is also rasterized to
 
 Then checks that the theme ships preview.png (WARN if not; Omarchy's theme
 picker shows a blank without it) and lists screenshots/.
-Exit 0 = rendered, 1 = could not render (colors.toml unusable), 2 = usage.
+Exit 0 = rendered, 1 = could not render (colors.toml unusable) or preview.png is
+corrupt, 2 = usage (including a name or version that is not a safe file name).
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import ANSI, load_colors, rgb_of  # noqa: E402
+from common import ANSI, NAME_RE, SEMVER, load_colors, png_info, rgb_of  # noqa: E402
 
 W, H = 1200, 720
 FONT = 18
@@ -183,19 +184,15 @@ def rasterize_svg(svg: Path) -> Path | None:
     return None
 
 
-def png_size(p: Path):
-    with p.open("rb") as fh:
-        head = fh.read(24)
-    if head[:8] != b"\x89PNG\r\n\x1a\n":
-        return None
-    return struct.unpack(">II", head[16:24])
-
-
 def main(argv) -> int:
     if len(argv) != 4:
         print(__doc__.strip(), file=sys.stderr)
         return 2
     theme, out, name, version = Path(argv[0]), Path(argv[1]), argv[2], argv[3]
+    # name and version become file names under out-dir: refuse anything that could escape it.
+    if not NAME_RE.match(name) or not (version == "unknown" or SEMVER.match(version)):
+        print(f"render_preview.py: unsafe name or version: {name!r} {version!r}", file=sys.stderr)
+        return 2
     rc = 0
     try:
         d = load_colors(theme)
@@ -218,11 +215,11 @@ def main(argv) -> int:
 
     pv = theme / "preview.png"
     if pv.is_file() and not pv.is_symlink():
-        size = png_size(pv)
-        if size:
-            print(f"  [PASS] theme ships preview.png ({size[0]}x{size[1]})")
-        else:
-            print("  [FAIL] theme preview.png is not a valid PNG")
+        try:
+            w, h = png_info(pv)
+            print(f"  [PASS] theme ships preview.png ({w}x{h})")
+        except (OSError, ValueError) as e:
+            print(f"  [FAIL] theme preview.png is not a valid PNG: {e}")
             rc = 1
     else:
         print("  [WARN] theme has no preview.png (the Omarchy theme picker shows a blank)")

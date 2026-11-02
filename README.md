@@ -24,20 +24,23 @@ make test
 
 | Step | Checks | Fails when |
 |---|---|---|
-| 1. validate files | `colors.toml` parses with `tomllib`, `mode` is `dark`/`light`, all 25 Omarchy 4 palette keys are present (26 with `mode`, the same list as Glazier's `validate-theme.sh`), values are valid colors. `VERSION` is strict semver. CHANGELOG has a non-empty heading for that version. README and LICENSE are present and non-empty, and README local links/images point to files that ship. `backgrounds/` has an image. No junk (`.DS_Store`, `*~`, `*.bak`/`.orig`/`.swp`, `.#*`, nested `.git`, archives, caches, `.gitleaks.toml`), no symlinks or special files, no unreplaced `{{VERSION}}`-style placeholders. Warns about a missing or non-executable `install.sh`/`uninstall.sh`, hidden files, files Omarchy 4 ignores for git installs (`*.lua`, `kitty.conf`, …), `colorN` that differ from their semantic key, and uncommitted changes in a git checkout | any check fails |
+| 1. validate files | `colors.toml` parses with `tomllib`, `mode` is `dark`/`light`, all 25 Omarchy 4 palette keys are present (26 with `mode`, the same list as Glazier's `validate-theme.sh`), values are valid colors. `VERSION` is strict SemVer 2.0.0 (no leading zeros in numeric identifiers, prerelease ones included, so `1.2.3-01` fails). CHANGELOG has a non-empty heading for that version. README and LICENSE are present and non-empty, and README local links/images point to files that ship. `backgrounds/` has an image. `preview.png` and `screenshots/*.png` are fully checked PNGs (see step 3). No junk (`.DS_Store`, `*~`, `*.bak`/`.orig`/`.swp`, `.#*`, nested `.git`, archives, caches, `.gitleaks.toml`), no symlinks or special files, no unreplaced `{{VERSION}}`-style placeholders. Warns about a missing or non-executable `install.sh`/`uninstall.sh`, hidden files, files Omarchy 4 ignores for git installs (`*.lua`, `kitty.conf`, …), `colorN` that differ from their semantic key, and uncommitted changes in a git checkout | any check fails |
 | 2. WCAG contrast | foreground/background, selection text on selection background, color1–color7 on background: **4.5:1**. Cursor and accent on background: **3:1** (non-text). Bright colors, `dark/light/bright_foreground` and `muted` are advisory. color0 (and color7 when within 1.5:1 of the background) is a background-shade slot and is listed but not judged. The math mirrors `/workspace/qa/tools/contrast-check.py` | an enforced pair is below its minimum |
-| 3. preview | Renders `OUT/previews/<name>-<ver>-preview.svg` (real monospace text) and `.png` (a pure-stdlib PNG encoder: palette, terminal mock, 16 ANSI swatches; text is drawn as word bars). Also checks the theme's own `preview.png` is a valid PNG and lists `screenshots/` | colors.toml is unusable or `preview.png` is corrupt (missing `preview.png` is a warning) |
+| 3. preview | Renders `OUT/previews/<name>-<ver>-preview.svg` (real monospace text) and `.png` (a pure-stdlib PNG encoder: palette, terminal mock, 16 ANSI swatches; text is drawn as word bars). Also checks the theme's own `preview.png` is a valid PNG and lists `screenshots/`. The PNG check is structural, not just the signature: every chunk length and CRC, IHDR first with valid fields, PLTE for palette images, consecutive IDATs, IEND last with nothing after it, and the image data must decompress to exactly the expected scanlines with valid filter bytes | colors.toml is unusable or `preview.png` is corrupt (missing `preview.png` is a warning) |
 | 4. package | Stages the shipping files (the top-level `.git`, `.github`, `.gitignore`, `.gitattributes`, `tests` and `releases` are left out), then builds `<name>-<ver>.tar.gz` with the `tools/pack/repro-tar.sh` / `templates/build-release.sh` settings: one top-level folder named after the theme, `--sort=name`, GNU format, every mtime = `SOURCE_DATE_EPOCH`, owner 0/0 numeric, modes 0644/0755, `gzip -n --best`, plus a `sha256sum`-format `.sha256`. It builds **twice** from fresh stages and requires byte-identical output, then verifies the archive (paths, owners, mtimes, modes, order, gzip header, content = stage) | the builds differ or the archive shape is wrong |
 | 5. pre-publish gate | Extracts the archive into a temp dir, `git init`s it with one commit by `synthalorian <212206047+synthalorian@users.noreply.github.com>` (no global config or hooks), and runs `gate.sh` on it. `GATE_NAME_PATTERN_FILE` is passed through when set. The pipeline never prints its path or contents, and the gate prints locations only | gate exit ≠ 0, or the gate script is missing |
 | 6. gitleaks | `gitleaks dir` on the extracted archive, with the built-in rules pinned (`[extend] useDefault = true`, an empty ignore dir, `GITLEAKS_CONFIG*` unset) and `--redact=100` | any finding (skipped if gitleaks isn't installed) |
 
 Packaging and the gate are skipped once validation fails. The archive and `.sha256` are
-copied to `OUT` **only when every step passes**. The previews and
-`OUT/<name>-<ver>.release-report.txt` (the full console log) are always written.
+copied to `OUT` **only when every step passes**. Each copy goes to a temp file in `OUT`, is compared
+with the source, then renamed into place. If either copy fails (disk full, permissions), neither is left
+behind and the result is FAIL. The previews and `OUT/<name>-<ver>.release-report.txt` (the full console log)
+are written on PASS and FAIL. If the report can't be written, the run ends `RESULT: FAIL` with exit 1.
 
 **Theme name:** `NAME=`/`--name`, else the basename of the checkout's `remote.origin.url`, else the folder
 name. It is lowercased, spaces become `-`, and a leading `omarchy-` and trailing `-theme` are stripped, as
-`omarchy-theme-install` does. The name must match `^[a-z0-9_][a-z0-9._+-]*$`.
+`omarchy-theme-install` does. The name must match `^[a-z0-9_][a-z0-9._+-]*$`. It is checked before anything
+is written (not even `OUT` is created), so a name like `../../x` is a usage error (exit 2) and can't escape `OUT`.
 
 **mtime:** `SOURCE_DATE_EPOCH` if set, else the last git commit touching the theme folder, else 0 (the
 same rule as `repro-tar.sh` and `build-release.sh`). The published Glyphsmith archives were built with
@@ -52,7 +55,9 @@ mtime 0, so set `SOURCE_DATE_EPOCH=0` to reproduce them byte for byte (see below
 | `GATE_NAME_PATTERN_FILE` | passed to the gate for its name-leak check; never printed |
 | `GITLEAKS` | gitleaks binary; `none` skips the step |
 
-Exit codes: `0` PASS, `1` FAIL, `2` usage error (bad theme dir, `OUT` inside the theme dir, …).
+Exit codes: `0` PASS, `1` FAIL, `2` usage error (bad theme dir, `OUT` inside the theme dir, invalid theme name, …).
+`make release` hands `THEME`, `OUT` and `NAME` to the recipe through the environment, so quotes, `$` or
+backticks in them are never run by the shell.
 Heavy commands run under `nice` and `timeout`.
 
 ## Layout
@@ -77,15 +82,20 @@ tests/fixtures/        testforge (dark, good), daylight (light, good, pre-releas
 make test        # or: tests/run-tests.sh   (SKIP_REAL_GATE=1 to skip the real-gate cases)
 ```
 
-The suite copies the fixtures into a temp dir and generates the bad themes there by mutation. That covers 29
-validation failures: missing key, mode, bad TOML, bad color, semver, missing or empty CHANGELOG
-entry, README, LICENSE, `.DS_Store`, backups, swap files, nested `.git`, `.gitleaks.toml`, file and dir symlinks,
-placeholders, broken or escaping README links, no backgrounds, corrupt PNG, and a bad name. It also covers warnings,
-the contrast failures, preview rendering (PNG decoded and CRC-checked, SVG parsed), and end-to-end runs. Those check
+The suite copies the fixtures into a temp dir and generates the bad themes there by mutation. That covers 33
+validation failures: missing key, mode, bad TOML, bad color, semver (including a leading-zero prerelease), missing or
+empty CHANGELOG entry, README, LICENSE, `.DS_Store`, backups, swap files, nested `.git`, `.gitleaks.toml`, file and dir
+symlinks, placeholders, broken or escaping README links, no backgrounds, corrupt PNGs (not a PNG, a 24-byte fake header,
+a bad CRC, a corrupt screenshot), and a bad name. Unit tests cover strict semver and the PNG checker (truncation, CRCs,
+missing IDAT/IEND, trailing data, short/long/non-zlib image data, filter bytes, IHDR fields, PLTE). It also covers warnings,
+the contrast failures, preview rendering (PNG decoded and CRC-checked, SVG parsed, unsafe names refused), and end-to-end runs. Those check
 the archive layout and modes, that `.git`/`.github`/`tests` are excluded, byte-identical repeat builds,
 `SOURCE_DATE_EPOCH`, `--name`, that no archive is written on FAIL, failing and missing gates, a planted fake key caught by gitleaks
-and redacted, and usage errors. The real gate is run too: plain, with a non-matching pattern file, and with a matching one. Those
-cases assert that the pattern text and path never appear in the output. Current result: **140 passed, 0 failed** (about 9 s).
+and redacted, and usage errors. Regression cases cover unsafe names from `--name` and from the git remote (nothing is
+written inside or outside `OUT`), archive, `.sha256` and report copy failures (FAIL, exit 1, no partial files), shell
+metacharacters in `make release` variables (no injected command runs, and quoted paths still work), and the suite
+aborting when it can't create its temp dir. The real gate is run too: plain, with a non-matching pattern file, and with a matching one. Those
+cases assert that the pattern text and path never appear in the output. Current result: **207 passed, 0 failed** (about 11 s).
 
 ## First real run: Steel & Ember 0.1.1
 
