@@ -40,6 +40,9 @@ done
 [[ -n $THEME ]] || usage
 [[ -d $THEME ]] || die "not a directory: $THEME"
 THEME=$(cd -- "$THEME" && pwd -P)
+# Check before creating anything: the theme dir is never written to.
+OUT=$(realpath -m -- "$OUT") || die "bad output dir: $OUT"
+case "$OUT/" in "$THEME"/*) die "output dir must not be inside the theme dir" ;; esac
 mkdir -p -- "$OUT" || die "cannot create output dir: $OUT"
 OUT=$(cd -- "$OUT" && pwd -P)
 case "$OUT/" in "$THEME"/*) die "output dir must not be inside the theme dir" ;; esac
