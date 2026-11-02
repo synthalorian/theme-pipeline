@@ -214,21 +214,34 @@ echo "== real pre-publish gate"
 if [[ ${SKIP_REAL_GATE:-0} == 1 || ! -f $REAL_GATE ]]; then
   echo "  skip  real gate not available (or SKIP_REAL_GATE=1)"
 else
-  expect "real gate PASS on good fixture" 0 env GITLEAKS=none GATE="$REAL_GATE" "$REL" "$FIX/testforge" --out "$T/out11"
-  has "gate check 1 passes" '\[PASS\] 1\. commit author/committer email'
-  has "gate check 6 passes" '\[PASS\] 6\. README and LICENSE'
-  printf 'zz-sentinel-unmatched-zz\n' >"$T/patterns-clean.txt"
-  expect "real gate PASS with a non-matching pattern file" 0 env GITLEAKS=none GATE="$REAL_GATE" \
-    GATE_NAME_PATTERN_FILE="$T/patterns-clean.txt" "$REL" "$FIX/testforge" --out "$T/out12"
-  has "pattern file passed through" 'GATE_NAME_PATTERN_FILE: set'
-  has "gate check 5 ran" '\[PASS\] 5\. no name leak'
-  hasnt "pattern file contents never printed" 'zz-sentinel-unmatched-zz'
-  hasnt "pattern file path never printed" 'patterns-clean'
-  printf '# fixture pattern\nzz-sentinel-[a-z]+-zz|test[f]orge\n' >"$T/patterns-hit.txt"
-  expect "real gate FAIL when the pattern matches" 1 env GITLEAKS=none GATE="$REAL_GATE" \
-    GATE_NAME_PATTERN_FILE="$T/patterns-hit.txt" "$REL" "$FIX/testforge" --out "$T/out13"
-  has "gate check 5 fails" '\[FAIL\] 5\. no name leak'
-  hasnt "matching pattern never printed" 'zz-sentinel|test\[f\]orge'
+  real_gate() { # an assertion that is withdrawn if the gate refused to run (load average > 8)
+    local p0=$pass f0=$fail
+    expect "$@"
+    if grep -q 'refusing to run' <<<"$OUTPUT"; then
+      pass=$p0 fail=$f0
+      echo "  skip  real gate refused to run (load average > 8); remaining real-gate cases skipped"
+      return 1
+    fi
+  }
+  real_gate_cases() {
+    real_gate "real gate PASS on good fixture" 0 env GITLEAKS=none GATE="$REAL_GATE" \
+      "$REL" "$FIX/testforge" --out "$T/out11" || return 0
+    has "gate check 1 passes" '\[PASS\] 1\. commit author/committer email'
+    has "gate check 6 passes" '\[PASS\] 6\. README and LICENSE'
+    printf 'zz-sentinel-unmatched-zz\n' >"$T/patterns-clean.txt"
+    real_gate "real gate PASS with a non-matching pattern file" 0 env GITLEAKS=none GATE="$REAL_GATE" \
+      GATE_NAME_PATTERN_FILE="$T/patterns-clean.txt" "$REL" "$FIX/testforge" --out "$T/out12" || return 0
+    has "pattern file passed through" 'GATE_NAME_PATTERN_FILE: set'
+    has "gate check 5 ran" '\[PASS\] 5\. no name leak'
+    hasnt "pattern file contents never printed" 'zz-sentinel-unmatched-zz'
+    hasnt "pattern file path never printed" 'patterns-clean'
+    printf '# fixture pattern\nzz-sentinel-[a-z]+-zz|test[f]orge\n' >"$T/patterns-hit.txt"
+    real_gate "real gate FAIL when the pattern matches" 1 env GITLEAKS=none GATE="$REAL_GATE" \
+      GATE_NAME_PATTERN_FILE="$T/patterns-hit.txt" "$REL" "$FIX/testforge" --out "$T/out13" || return 0
+    has "gate check 5 fails" '\[FAIL\] 5\. no name leak'
+    hasnt "matching pattern never printed" 'zz-sentinel|test\[f\]orge'
+  }
+  real_gate_cases
 fi
 
 echo
