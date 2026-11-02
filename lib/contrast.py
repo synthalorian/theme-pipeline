@@ -5,9 +5,11 @@ Usage: contrast.py <theme-dir>
 
 Enforced (FAIL below the minimum):
   text 4.5:1  foreground on background, selection text on selection
-              background, normal ANSI colors on background (dark mode:
-              color1-7; light mode: color0-6; a slot within 1.5:1 of the
-              background is a background shade by convention and only listed)
+              background, normal ANSI colors color1-color7 on background.
+              color0 (black) is a background shade by convention in both
+              modes (black/white are swapped on light themes), and color7 is
+              treated as one too when it is within 1.5:1 of the background;
+              those are listed as INFO, not judged
   ui   3.0:1  cursor on background, accent on background (WCAG 1.4.11)
 Advisory (WARN only):
   text 4.5:1  bright ANSI colors, dark/light/bright_foreground on background
@@ -42,7 +44,6 @@ def ratio(fg: str, bg: str) -> float | None:
 def pairs(d: dict):
     """Yield (label, fg, bg, minimum, enforced)."""
     bg, fg = d.get("background"), d.get("foreground")
-    light = d.get("mode") == "light"
     yield "foreground on background", fg, bg, TEXT_MIN, True
     if d.get("selection_foreground") and d.get("selection_background"):
         yield "selection_foreground on selection_background", d["selection_foreground"], d["selection_background"], \
@@ -55,7 +56,6 @@ def pairs(d: dict):
         yield "accent on background", d["accent"], bg, UI_MIN, True
 
     seen = set()
-    shade_slot = 7 if light else 0  # black on dark themes, white on light themes
     for i, n in enumerate(ANSI):
         for key in (f"color{i}", n if n not in ("black", "white") else SLOT_KEYS[i]):
             val = d.get(key)
@@ -64,7 +64,7 @@ def pairs(d: dict):
             seen.add((i, str(val).lower()))
             r = ratio(val, bg)
             label = f"color{i} {n} ({key}) on background" if key != f"color{i}" else f"color{i} {n} on background"
-            if i == shade_slot or (r is not None and r < SHADE_MAX):
+            if i == 0 or (i == 7 and r is not None and r < SHADE_MAX):
                 yield label, val, bg, None, False
             else:
                 yield label, val, bg, TEXT_MIN, True
