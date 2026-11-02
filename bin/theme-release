@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# theme-release: validate, contrast-check, preview, package and gate an Omarchy 4 theme.
+#
+# Usage: theme-release <theme-dir> [--out DIR] [--name NAME]
+#   --out DIR    output folder (default ./out); the theme dir is only read
+#   --name NAME  theme name (default: git remote origin basename of the theme
+#                checkout, else the folder name; "omarchy-" and "-theme" are stripped)
+#
+# Env: SOURCE_DATE_EPOCH       archive mtime (default: last git commit of the theme dir, else 0)
+#      GATE                    pre-publish gate script (default /workspace/pre-publish-gate/gate.sh)
+#      GATE_NAME_PATTERN_FILE  passed through to the gate (contents are never printed)
+#      GITLEAKS                gitleaks binary (default: gitleaks on PATH; "none" skips)
+#
+# Writes OUT/<name>-<ver>.tar.gz + .sha256 (only when every step passes),
+# OUT/previews/<name>-<ver>-preview.{svg,png} and OUT/<name>-<ver>.release-report.txt.
+# Exit 0 = PASS, 1 = FAIL, 2 = usage error.
+set -uo pipefail
+export LC_ALL=C TZ=UTC
+
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+LIB=$(cd -- "$HERE/../lib" && pwd -P)
+GATE=${GATE:-/workspace/pre-publish-gate/gate.sh}
+NOREPLY_NAME=synthalorian
+NOREPLY_EMAIL=212206047+synthalorian@users.noreply.github.com
+
+usage() { sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+die() { printf 'theme-release: %s\n' "$*" >&2; exit 2; }
+
+THEME="" OUT="out" NAME=""
+while (($#)); do
+  case $1 in
+    --out) (($# > 1)) || usage; OUT=$2; shift ;;
+    --name) (($# > 1)) || usage; NAME=$2; shift ;;
+    -h|--help) usage ;;
+    -*) die "unknown option: $1" ;;
+    *) [[ -z $THEME ]] || die "only one theme dir"; THEME=$1 ;;
+  esac
+  shift
+done
+[[ -n $THEME ]] || usage
+[[ -d $THEME ]] || die "not a directory: $THEME"
+THEME=$(cd -- "$THEME" && pwd -P)
+# Theme name: --name, else the git remote basename (omarchy-<name>-theme), else the folder name.
+name_source="folder name"
+if [[ -n $NAME ]]; then
+  raw=$NAME name_source="--name"
+elif [[ $(git -C "$THEME" rev-parse --show-toplevel 2>/dev/null) == "$THEME" ]] \
+    && url=$(git -C "$THEME" config --get remote.origin.url 2>/dev/null) && [[ -n $url ]]; then
+  raw=${url%/}; raw=${raw##*/}; raw=${raw##*:}; name_source="git remote origin"
+else
+  raw=${THEME##*/}
+fi
+raw=${raw%.git}
+NAME=$(printf '%s' "$raw" | tr '[:upper:] ' '[:lower:]-' | sed -E 's/^omarchy-//; s/-theme$//')
+# The name becomes file names under OUT (previews, archive, report): refuse an unsafe one
+# before anything is written. Same pattern as NAME_RE in lib/common.py.
+[[ $NAME =~ ^[a-z0-9_][a-z0-9._+-]*$ ]] \
+  || die "theme name '$NAME' (from $name_source) does not match ^[a-z0-9_][a-z0-9._+-]*$"
+
+# Check before creating anything: the theme dir is never written to.
+OUT=$(realpath -m -- "$OUT") || die "bad output dir: $OUT"
+case "$OUT/" in "$THEME"/*) die "output dir must not be inside the theme dir" ;; esac
+mkdir -p -- "$OUT" || die "cannot create output dir: $OUT"
+OUT=$(cd -- "$OUT" && pwd -P)
+case "$OUT/" in "$THEME"/*) die "output dir must not be inside the theme dir" ;; esac
+command -v python3 >/dev/null || die "python3 is required"
+[[ $(tar --version 2>/dev/null) == *'GNU tar'* ]] || die "GNU tar is required"
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/theme-release.XXXXXX") || die "mktemp failed"
+trap 'rm -rf -- "$WORK"' EXIT
+py() { timeout 600 nice -n 10 python3 -I "$@"; }
+
+# install_artifact <src> <dest>: copy via a temp file in the same dir, check the copy
+# is complete, then rename into place, so a failed copy never leaves a partial file.
+install_artifact() {
+  local tmp
+  # mktemp creates the temp file exclusively (O_EXCL), so a planted symlink is never followed.
+  if [[ -L $2 || ( -e $2 && ! -f $2 ) ]]; then echo "  refusing to replace $2: symlink or not a regular file" >&2; return 1; fi
+  tmp=$(mktemp -- "$(dirname -- "$2")/.$(basename -- "$2").tmp.XXXXXX") || { echo "  cannot write $2" >&2; return 1; }
+  if cat -- "$1" >"$tmp" && chmod 644 -- "$tmp" && cmp -s -- "$1" "$tmp" && mv -fT -- "$tmp" "$2"; then return 0; fi
+  rm -f -- "$tmp"
+  echo "  cannot write $2" >&2
+  return 1
+}
+
+main() {
+  local -a STEP_NAMES=() STEP_RESULTS=()
+  local rc status version epoch tarball=""
+
+  record() { STEP_NAMES+=("$1"); STEP_RESULTS+=("$2"); printf '  -> %s\n\n' "$2"; }
+  # step <title> <cmd...>: run, stream output, PASS/WARN/FAIL from exit code and [WARN] lines
+  step() {
+    local title=$1; shift
+    printf '== %s\n' "$title"
+    "$@" 2>&1 | tee "$WORK/step.out"
+    local r=${PIPESTATUS[0]}
+    if ((r != 0)); then record "$title" "FAIL"
+    elif grep -q '\[WARN\]' "$WORK/step.out"; then record "$title" "PASS (warnings)"
+    elif grep -q '^\[SKIP\]' "$WORK/step.out"; then record "$title" "PASS (with skips)"
+    else record "$title" "PASS"; fi
+    return "$r"
+  }
+
+  echo "theme-release: $THEME"
+  echo "  name    : $NAME (from $name_source)"
+  echo "  out     : $OUT"
+  echo "  date    : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo
+
+  step "1. validate files" py "$LIB/validate.py" "$THEME" "$NAME" --emit "$WORK/meta"
+  local validated=$?
+  version=$(sed -n 's/^VERSION=//p' "$WORK/meta" 2>/dev/null)
+  version=${version:-unknown}
+  echo "$NAME $version" >"$WORK/id"
+
+  step "2. WCAG contrast (colors.toml key pairs)" py "$LIB/contrast.py" "$THEME"
+
+  step "3. preview render + preview assets" py "$LIB/render_preview.py" "$THEME" "$OUT/previews" "$NAME" "$version"
+
+  # 4. package
+  local title="4. package $NAME-$version.tar.gz (reproducible)"
+  if ((validated != 0)); then
+    printf '== %s\n  skipped: validation failed\n' "$title"; record "$title" "SKIP (validation failed)"
+  else
+    if [[ -n ${SOURCE_DATE_EPOCH:-} ]]; then
+      epoch=$SOURCE_DATE_EPOCH esrc="SOURCE_DATE_EPOCH"
+    elif git -C "$THEME" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        && epoch=$(git -C "$THEME" log -1 --format=%ct -- . 2>/dev/null) && [[ -n $epoch ]]; then
+      esrc="last git commit"
+    else
+      epoch=0 esrc="default"
+    fi
+    package() {
+      local n
+      for n in a b; do
+        mkdir -p "$WORK/stage-$n" "$WORK/pkg-$n"
+        py "$LIB/stage.py" "$THEME" "$WORK/stage-$n" "$NAME" || return 1
+        timeout 600 nice -n 10 bash "$LIB/pack.sh" "$WORK/stage-$n" "$NAME" \
+          "$WORK/pkg-$n/$NAME-$version.tar.gz" "$epoch" || return 1
+      done
+      echo "  mtime   : @$epoch ($(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ), $esrc)"
+      if cmp -s "$WORK/pkg-a/$NAME-$version.tar.gz" "$WORK/pkg-b/$NAME-$version.tar.gz"; then
+        echo "  [PASS] reproducible: two independent builds are byte-identical"
+      else
+        echo "  [FAIL] two builds differ"; return 1
+      fi
+      py "$LIB/verify_archive.py" "$WORK/pkg-a/$NAME-$version.tar.gz" "$NAME" "$epoch" "$WORK/stage-a" || return 1
+      echo "  size    : $(stat -c %s "$WORK/pkg-a/$NAME-$version.tar.gz") bytes"
+      echo "  sha256  : $(cut -d' ' -f1 "$WORK/pkg-a/$NAME-$version.tar.gz.sha256")"
+      echo "  contents:"
+      tar -tzvf "$WORK/pkg-a/$NAME-$version.tar.gz" | awk '{printf "    %s %s %8s  %s\n", $1, $2, $3, $6}'
+    }
+    if step "$title" package; then tarball="$WORK/pkg-a/$NAME-$version.tar.gz"; fi
+  fi
+
+  # 5. pre-publish gate on a temp git copy of the extracted archive
+  title="5. pre-publish gate ($GATE)"
+  local repo="$WORK/gate/$NAME"
+  if [[ -z $tarball ]]; then
+    printf '== %s\n  skipped: no archive\n' "$title"; record "$title" "SKIP (no archive)"
+  else
+    gate() {
+      [[ -f $GATE ]] || { echo "  gate script not found: $GATE"; return 1; }
+      mkdir -p "$WORK/gate"
+      tar -xzf "$tarball" -C "$WORK/gate" --no-same-owner --no-same-permissions || return 1
+      local -a g=(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+        GIT_AUTHOR_NAME="$NOREPLY_NAME" GIT_AUTHOR_EMAIL="$NOREPLY_EMAIL"
+        GIT_COMMITTER_NAME="$NOREPLY_NAME" GIT_COMMITTER_EMAIL="$NOREPLY_EMAIL"
+        GIT_AUTHOR_DATE="@$epoch +0000" GIT_COMMITTER_DATE="@$epoch +0000"
+        git -C "$repo" -c core.hooksPath=/dev/null -c commit.gpgsign=false -c init.defaultBranch=main)
+      "${g[@]}" init -q && "${g[@]}" add -A && "${g[@]}" commit -q -m "$NAME $version" || return 1
+      echo "  temp repo: 1 commit by $NOREPLY_NAME <$NOREPLY_EMAIL>"
+      if [[ -n ${GATE_NAME_PATTERN_FILE:-} ]]; then
+        echo "  GATE_NAME_PATTERN_FILE: set (passed through; contents never printed)"
+      else
+        echo "  GATE_NAME_PATTERN_FILE: unset (gate check 5 will be skipped)"
+      fi
+      # The gate refuses to run while the load average is above 8: wait and retry a few times.
+      local try r
+      for try in 1 2 3 4; do
+        timeout 1200 nice -n 10 bash "$GATE" "$repo" 2>&1 | tee "$WORK/gate.out"
+        r=${PIPESTATUS[0]}
+        ((r == 2)) && grep -q 'refusing to run' "$WORK/gate.out" && ((try < 4)) || return "$r"
+        echo "  gate refused (high load); retry $((try + 1))/4 in 30s"
+        sleep 30
+      done
+    }
+    step "$title" gate
+  fi
+
+  # 6. gitleaks
+  title="6. gitleaks (extracted archive)"
+  local gl=${GITLEAKS:-$(command -v gitleaks || true)}
+  if [[ $gl == none || -z $gl ]]; then
+    printf '== %s\n  skipped: gitleaks not on PATH\n' "$title"; record "$title" "SKIP (not installed)"
+  elif [[ ! -d $repo ]]; then
+    printf '== %s\n  skipped: no archive\n' "$title"; record "$title" "SKIP (no archive)"
+  else
+    leaks() {
+      # Pin the built-in rules: no config or ignore file from the scanned tree or the environment.
+      printf '[extend]\nuseDefault = true\n' >"$WORK/gitleaks.toml"
+      mkdir -p "$WORK/gl-ignore"
+      env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML timeout 600 nice -n 10 \
+        "$gl" dir --no-banner --redact=100 --no-color -c "$WORK/gitleaks.toml" -i "$WORK/gl-ignore" \
+        --exit-code 1 "$repo" 2>&1 | sed 's/^/  /'
+      local r=${PIPESTATUS[0]}
+      ((r == 0)) && echo "  [PASS] gitleaks: no leaks found" || echo "  [FAIL] gitleaks exit $r"
+      return "$r"
+    }
+    step "$title" leaks
+  fi
+
+  # Summary
+  local fails=0 i
+  echo "================ SUMMARY: $NAME $version ================"
+  for i in "${!STEP_NAMES[@]}"; do
+    printf '  %-18s %s\n' "${STEP_RESULTS[i]}" "${STEP_NAMES[i]}"
+    [[ ${STEP_RESULTS[i]} == FAIL* ]] && fails=$((fails + 1))
+  done
+  if ((fails == 0)) && [[ -n $tarball ]]; then
+    if install_artifact "$tarball" "$OUT/$NAME-$version.tar.gz" \
+        && install_artifact "$tarball.sha256" "$OUT/$NAME-$version.tar.gz.sha256"; then
+      echo "  artifact: $OUT/$NAME-$version.tar.gz"
+      echo "  sha256  : $(cut -d' ' -f1 "$OUT/$NAME-$version.tar.gz.sha256")"
+      echo "RESULT: PASS"
+      return 0
+    fi
+    rm -f -- "$OUT/$NAME-$version.tar.gz" "$OUT/$NAME-$version.tar.gz.sha256"
+    echo "  [FAIL] could not write the archive to $OUT (disk full or permissions?)"
+    echo "RESULT: FAIL"
+    return 1
+  fi
+  echo "  no archive written to $OUT ($fails failing step(s))"
+  [[ -e $OUT/$NAME-$version.tar.gz ]] && echo "  note: $OUT/$NAME-$version.tar.gz is from an earlier run"
+  echo "RESULT: FAIL"
+  return 1
+}
+
+main 2>&1 | tee "$WORK/report.txt"
+rc=${PIPESTATUS[0]}
+read -r id_name id_version <"$WORK/id" 2>/dev/null || { id_name=$NAME id_version=unknown; }
+report=$OUT/$id_name-$id_version.release-report.txt
+if install_artifact "$WORK/report.txt" "$report"; then
+  echo "report: $report"
+else
+  echo "RESULT: FAIL (the release report could not be written)"
+  ((rc == 0)) && rc=1
+fi
+exit "$rc"
